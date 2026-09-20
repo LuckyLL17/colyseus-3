@@ -1,5 +1,8 @@
 import assert from "assert";
-import { LocalPresence, type Presence, RedisPresence } from "../src/index.ts";
+import fs from "fs";
+import path from "path";
+import sinon from "sinon";
+import { LocalPresence, setDevMode, type Presence, RedisPresence } from "../src/index.ts";
 import { timeout } from "./utils/index.ts";
 
 const PRESENCE_IMPLEMENTATIONS = [LocalPresence, RedisPresence];
@@ -182,6 +185,70 @@ describe("Presence", () => {
         assert.ok(!(await presence.get("setex1")));
       });
 
+      it("setex: replacing the value with set removes its expiration", async () => {
+        const key = `ttl-overwrite-${Date.now()}-${Math.random()}`;
+        const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+
+        try {
+          await presence.setex(key, "short-lived", 1);
+          await presence.set(key, "persistent");
+          if (clock) { await clock.tickAsync(1100); } else { await timeout(1100); }
+          assert.strictEqual("persistent", await presence.get(key));
+        } finally {
+          clock?.restore();
+          await presence.del(key);
+        }
+      });
+
+      it("setex: deleting and recreating a key removes the old expiration", async () => {
+        const key = `ttl-recreate-${Date.now()}-${Math.random()}`;
+        const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+
+        try {
+          await presence.setex(key, "short-lived", 1);
+          await presence.del(key);
+          await presence.set(key, "recreated");
+          if (clock) { await clock.tickAsync(1100); } else { await timeout(1100); }
+          assert.strictEqual("recreated", await presence.get(key));
+        } finally {
+          clock?.restore();
+          await presence.del(key);
+        }
+      });
+
+      it("setex: renewing a key with a longer TTL keeps the latest value", async () => {
+        const key = `ttl-renew-${Date.now()}-${Math.random()}`;
+        const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+
+        try {
+          await presence.setex(key, "short-lived", 1);
+          await presence.setex(key, "renewed", 2);
+          if (clock) { await clock.tickAsync(1100); } else { await timeout(1100); }
+          assert.strictEqual("renewed", await presence.get(key));
+          if (clock) { await clock.tickAsync(1000); } else { await timeout(1000); }
+          assert.ok(!(await presence.get(key)));
+        } finally {
+          clock?.restore();
+          await presence.del(key);
+        }
+      });
+
+      it("expire: does not create a key that does not exist", async () => {
+        const key = `ttl-missing-${Date.now()}-${Math.random()}`;
+        const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+
+        try {
+          await presence.del(key);
+          await presence.expire(key, 1);
+          if (clock) { await clock.tickAsync(1100); } else { await timeout(1100); }
+          assert.strictEqual(false, await presence.exists(key));
+          assert.ok(!(await presence.get(key)));
+        } finally {
+          clock?.restore();
+          await presence.del(key);
+        }
+      });
+
       it("get", async () => {
         await presence.setex("setex2", "one", 1);
         assert.equal("one", await presence.get("setex2"));
@@ -209,6 +276,26 @@ describe("Presence", () => {
 
         await presence.del("set");
         assert.equal(0, await presence.scard("set"));
+      });
+
+      it("expire: deleting and recreating a set removes the old expiration", async () => {
+        const key = `set-ttl-recreate-${Date.now()}-${Math.random()}`;
+        const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+        const advance = (ms: number) => clock ? clock.tickAsync(ms) : timeout(ms);
+
+        try {
+          presence.sadd(key, "old");
+          presence.expire(key, 1);
+          presence.del(key);
+          presence.sadd(key, "new");
+
+          await advance(1100);
+
+          assert.deepStrictEqual(["new"], await presence.smembers(key));
+        } finally {
+          clock?.restore();
+          await presence.del(key);
+        }
       });
 
       it("sismember", async () => {
@@ -376,6 +463,27 @@ describe("Presence", () => {
           assert.deepStrictEqual(null, result);
         });
 
+        it("rpop should delete an empty expired list", async () => {
+          const key = `list-ttl-recreate-${Date.now()}-${Math.random()}`;
+          const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+          const advance = (ms: number) => clock ? clock.tickAsync(ms) : timeout(ms);
+
+          try {
+            await presence.rpush(key, "old");
+            presence.expire(key, 1);
+            await presence.rpop(key);
+            await presence.rpush(key, "new");
+
+            await advance(1100);
+
+            assert.strictEqual(1, await presence.llen(key));
+            assert.strictEqual("new", await presence.lpop(key));
+          } finally {
+            clock?.restore();
+            await presence.del(key);
+          }
+        });
+
       });
 
       describe("hincrbyex", () => {
@@ -392,11 +500,84 @@ describe("Presence", () => {
           assert.strictEqual(null, await presence.hget("hincrbyex", "expired"));
         });
 
+        it("hincrbyex should not expire a hash deleted and recreated by hset", async () => {
+          const key = `hash-ttl-recreate-${Date.now()}-${Math.random()}`;
+          const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+          const advance = (ms: number) => clock ? clock.tickAsync(ms) : timeout(ms);
+
+          try {
+            await presence.hincrbyex(key, "old", 1, 1);
+            await presence.del(key);
+            await presence.hset(key, "new", "value");
+
+            await advance(1100);
+
+            assert.strictEqual("value", await presence.hget(key, "new"));
+          } finally {
+            clock?.restore();
+            await presence.del(key);
+          }
+        });
+
+        it("hincrbyex should keep the latest expiration when renewed", async () => {
+          const key = `hash-ttl-renew-${Date.now()}-${Math.random()}`;
+          const clock = presence instanceof LocalPresence ? sinon.useFakeTimers() : null;
+          const advance = (ms: number) => clock ? clock.tickAsync(ms) : timeout(ms);
+
+          try {
+            await presence.hincrbyex(key, "counter", 1, 1);
+            await presence.hincrbyex(key, "counter", 1, 2);
+
+            await advance(1100);
+            assert.strictEqual("2", await presence.hget(key, "counter"));
+
+            await advance(1000);
+            assert.strictEqual(null, await presence.hget(key, "counter"));
+          } finally {
+            clock?.restore();
+            await presence.del(key);
+          }
+        });
+
       });
 
     });
 
   }
+
+  describe("Presence:LocalPresence:devMode cache", () => {
+    const cachePath = path.resolve(process.cwd(), ".devmode.json");
+    let previousCache: string | null;
+
+    beforeEach(() => {
+      previousCache = fs.existsSync(cachePath) ? fs.readFileSync(cachePath, "utf8") : null;
+      if (previousCache !== null) { fs.rmSync(cachePath); }
+      setDevMode(true);
+    });
+
+    afterEach(() => {
+      setDevMode(false);
+      if (previousCache !== null) {
+        fs.writeFileSync(cachePath, previousCache, "utf8");
+      } else if (fs.existsSync(cachePath)) {
+        fs.rmSync(cachePath);
+      }
+    });
+
+    it("restores strings, sets and hashes after shutdown", async () => {
+      const firstPresence = new LocalPresence();
+      firstPresence.set("devmode:string", "cached");
+      firstPresence.sadd("devmode:set", "member");
+      firstPresence.hset("devmode:hash", "field", "value");
+      firstPresence.shutdown();
+
+      const restoredPresence = new LocalPresence();
+      assert.strictEqual("cached", restoredPresence.get("devmode:string"));
+      assert.deepStrictEqual(["member"], await restoredPresence.smembers("devmode:set"));
+      assert.strictEqual("value", await restoredPresence.hget("devmode:hash", "field"));
+      restoredPresence.shutdown();
+    });
+  });
 
   // RedisPresence-specific tests live in ./presence/RedisPresence.test.ts
 

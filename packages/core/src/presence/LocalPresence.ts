@@ -7,6 +7,13 @@ import { hasDevModeCache, isDevMode, getDevModeCache, writeDevModeCache } from '
 
 type Callback = (...args: any[]) => void;
 
+type ExpirationTarget = 'keys' | 'data' | 'hash';
+
+type Expiration = {
+    timeout: NodeJS.Timeout;
+    token: symbol;
+};
+
 export class LocalPresence implements Presence {
     public subscriptions: EventEmitter = new EventEmitter();
 
@@ -16,7 +23,7 @@ export class LocalPresence implements Presence {
 
     public keys: {[name: string]: string | number} = Object.create(null);
 
-    private timeouts: {[name: string]: NodeJS.Timeout} = Object.create(null);
+    private expirations = new Map<string, Map<ExpirationTarget, Expiration>>();
 
     constructor() {
       //
@@ -84,22 +91,64 @@ export class LocalPresence implements Presence {
 
     public set(key: string, value: string) {
         this.keys[key] = value;
+        this.clearExpiration(key, 'keys');
     }
 
     public setex(key: string, value: string, seconds: number) {
         this.keys[key] = value;
-        this.expire(key, seconds);
+        this.scheduleExpiration(key, 'keys', seconds);
     }
 
     public expire(key: string, seconds: number) {
-        // ensure previous timeout is clear before setting another one.
-        if (this.timeouts[key]) {
-            clearTimeout(this.timeouts[key]);
+        const targets: ExpirationTarget[] = [];
+
+        if (this.keys[key] !== undefined) { targets.push('keys'); }
+        if (this.data[key] !== undefined) { targets.push('data'); }
+        if (this.hash[key] !== undefined) { targets.push('hash'); }
+
+        targets.forEach((target) => this.scheduleExpiration(key, target, seconds));
+    }
+
+    private clearExpiration(key: string, target: ExpirationTarget) {
+        const expiration = this.expirations.get(key)?.get(target);
+        if (!expiration) { return; }
+
+        clearTimeout(expiration.timeout);
+        this.removeExpiration(key, target);
+    }
+
+    private clearAllExpirations(key: string) {
+        const targetExpirations = this.expirations.get(key);
+        for (const expiration of targetExpirations?.values() ?? []) {
+            clearTimeout(expiration.timeout);
         }
-        this.timeouts[key] = setTimeout(() => {
-            delete this.keys[key];
-            delete this.timeouts[key];
+        this.expirations.delete(key);
+    }
+
+    private removeExpiration(key: string, target: ExpirationTarget) {
+        const targetExpirations = this.expirations.get(key);
+        targetExpirations?.delete(target);
+        if (targetExpirations?.size === 0) { this.expirations.delete(key); }
+    }
+
+    private scheduleExpiration(key: string, target: ExpirationTarget, seconds: number) {
+        this.clearExpiration(key, target);
+
+        let targetExpirations = this.expirations.get(key);
+        if (!targetExpirations) {
+            targetExpirations = new Map();
+            this.expirations.set(key, targetExpirations);
+        }
+
+        const token = Symbol('expiration');
+        const timeout = setTimeout(() => {
+            if (this.expirations.get(key)?.get(target)?.token !== token) { return; }
+
+            delete this[target][key];
+            this.removeExpiration(key, target);
         }, seconds * 1000);
+
+        targetExpirations.set(target, { timeout, token });
     }
 
     public get(key: string) {
@@ -107,6 +156,7 @@ export class LocalPresence implements Presence {
     }
 
     public del(key: string) {
+        this.clearAllExpirations(key);
         delete this.keys[key];
         delete this.data[key];
         delete this.hash[key];
@@ -133,7 +183,23 @@ export class LocalPresence implements Presence {
     public srem(key: string, value: any) {
         if (this.data[key]) {
             spliceOne(this.data[key], this.data[key].indexOf(value));
+            this.deleteDataIfEmpty(key);
         }
+    }
+
+    private popData(key: string, fromStart: boolean) {
+        const values = this.data[key];
+        if (!Array.isArray(values) || values.length === 0) { return null; }
+
+        const value = fromStart ? values.shift() : values.pop();
+        this.deleteDataIfEmpty(key);
+        return value;
+    }
+
+    private deleteDataIfEmpty(key: string) {
+        if (this.data[key]?.length > 0) { return; }
+        this.clearExpiration(key, 'data');
+        delete this.data[key];
     }
 
     public scard(key: string) {
@@ -181,17 +247,7 @@ export class LocalPresence implements Presence {
         value += incrBy;
         this.hash[key][field] = value.toString();
 
-        //
-        // FIXME: delete only hash[key][field]
-        // (we can't use "HEXPIRE" in Redis because it's only available since Redis version 7.4.0+)
-        //
-        if (this.timeouts[key]) {
-          clearTimeout(this.timeouts[key]);
-        }
-        this.timeouts[key] = setTimeout(() => {
-            delete this.hash[key];
-            delete this.timeouts[key];
-        }, expireInSeconds * 1000);
+        this.scheduleExpiration(key, 'hash', expireInSeconds);
 
         return Promise.resolve(value);
     }
@@ -210,6 +266,10 @@ export class LocalPresence implements Presence {
         const success = this.hash?.[key]?.[field] !== undefined;
         if (success) {
             delete this.hash[key][field];
+            if (Object.keys(this.hash[key]).length === 0) {
+                this.clearExpiration(key, 'hash');
+                delete this.hash[key];
+            }
         }
         return Promise.resolve(success);
     }
@@ -262,14 +322,12 @@ export class LocalPresence implements Presence {
       return Promise.resolve(lastLength);
     }
 
-    public lpop(key: string): Promise<string> {
-      return Promise.resolve(Array.isArray(this.data[key])
-        ? this.data[key].shift()
-        : null);
+    public lpop(key: string): Promise<string | null> {
+        return Promise.resolve(this.popData(key, true));
     }
 
     public rpop(key: string): Promise<string | null> {
-      return Promise.resolve(this.data[key].pop());
+        return Promise.resolve(this.popData(key, false));
     }
 
     public brpop(...args: [...keys: string[], timeoutInSeconds: number]): Promise<[string, string] | null> {
@@ -279,7 +337,9 @@ export class LocalPresence implements Presence {
       const getFirstPopulated = (): [string, string] | null => {
         const keyWithValue = keys.find(key => this.data[key] && this.data[key].length > 0);
         if (keyWithValue) {
-          return [keyWithValue, this.data[keyWithValue].pop()];
+          const value = this.data[keyWithValue].pop();
+          this.deleteDataIfEmpty(keyWithValue);
+          return [keyWithValue, value];
         } else {
           return null;
         }

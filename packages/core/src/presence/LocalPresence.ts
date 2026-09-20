@@ -16,6 +16,7 @@ export class LocalPresence implements Presence {
 
     public keys: {[name: string]: string | number} = Object.create(null);
 
+    // one pending expiration per key; shared by strings/sets/lists/hashes
     private timeouts: {[name: string]: NodeJS.Timeout} = Object.create(null);
 
     constructor() {
@@ -82,24 +83,66 @@ export class LocalPresence implements Presence {
         );
     }
 
+    //
+    // Expiration tracking. A timeout may only remove the value it was created
+    // for: `setex(k,…)` followed by a plain `set(k,…)`, `del(k)` + recreate,
+    // another `setex()`/`expire()` with a different TTL, etc. must not let the
+    // old timer delete the newer value — same as Redis' per-key TTL semantics.
+    // The `clearExpiration()` call on every mutating operation invalidates the
+    // previous timer; the callback double-checks the handle in case scheduling
+    // races another mutation before it fires.
+    //
+
+    /** Clear a key's pending expiration, if any. Returns whether one existed. */
+    private clearExpiration(key: string): boolean {
+        const timeout = this.timeouts[key];
+        if (timeout !== undefined) {
+            clearTimeout(timeout);
+            delete this.timeouts[key];
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Schedule deletion of whichever type of value currently backs the key.
+     * If the key is gone by the time the timer fires (or a newer timer was
+     * scheduled for it), nothing is deleted.
+     */
+    private scheduleExpiration(key: string, seconds: number): NodeJS.Timeout | undefined {
+        // Redis: EXPIRE on a missing key is a no-op (returns 0, sets no timer).
+        if (!(key in this.keys) && !(key in this.data) && !(key in this.hash)) {
+            return;
+        }
+
+        this.clearExpiration(key);
+
+        const timeout = setTimeout(() => {
+            // another operation (set/del/setex/expire…) may have replaced us
+            if (this.timeouts[key] !== timeout) { return; }
+            delete this.keys[key];
+            delete this.data[key];
+            delete this.hash[key];
+            delete this.timeouts[key];
+        }, seconds * 1000);
+
+        this.timeouts[key] = timeout;
+        return timeout;
+    }
+
     public set(key: string, value: string) {
+        // Redis' SET removes any existing TTL on the key.
+        this.clearExpiration(key);
         this.keys[key] = value;
     }
 
     public setex(key: string, value: string, seconds: number) {
         this.keys[key] = value;
-        this.expire(key, seconds);
+        this.scheduleExpiration(key, seconds);
     }
 
     public expire(key: string, seconds: number) {
-        // ensure previous timeout is clear before setting another one.
-        if (this.timeouts[key]) {
-            clearTimeout(this.timeouts[key]);
-        }
-        this.timeouts[key] = setTimeout(() => {
-            delete this.keys[key];
-            delete this.timeouts[key];
-        }, seconds * 1000);
+        this.scheduleExpiration(key, seconds);
     }
 
     public get(key: string) {
@@ -107,6 +150,7 @@ export class LocalPresence implements Presence {
     }
 
     public del(key: string) {
+        this.clearExpiration(key);
         delete this.keys[key];
         delete this.data[key];
         delete this.hash[key];
@@ -185,13 +229,9 @@ export class LocalPresence implements Presence {
         // FIXME: delete only hash[key][field]
         // (we can't use "HEXPIRE" in Redis because it's only available since Redis version 7.4.0+)
         //
-        if (this.timeouts[key]) {
-          clearTimeout(this.timeouts[key]);
-        }
-        this.timeouts[key] = setTimeout(() => {
-            delete this.hash[key];
-            delete this.timeouts[key];
-        }, expireInSeconds * 1000);
+        // scheduleExpiration() clears any previous TTL first and won't delete a
+        // value newer than this increment — mirrors the Redis multi(HINCRBY, EXPIRE).
+        this.scheduleExpiration(key, expireInSeconds);
 
         return Promise.resolve(value);
     }

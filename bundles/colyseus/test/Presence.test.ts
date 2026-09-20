@@ -1,4 +1,5 @@
 import assert from "assert";
+import sinon from "sinon";
 import { LocalPresence, type Presence, RedisPresence } from "../src/index.ts";
 import { timeout } from "./utils/index.ts";
 
@@ -392,6 +393,151 @@ describe("Presence", () => {
           assert.strictEqual(null, await presence.hget("hincrbyex", "expired"));
         });
 
+      });
+
+      //
+      // Regression: a stale TTL timer must never delete a value written after
+      // the timer was armed. These exercise the same key through four timings
+      // (overwrite, delete+recreate, repeated renewal, missing key); Redis' TTL
+      // is a property of the key, so any later mutation invalidates the old one
+      // and LocalPresence must behave identically.
+      //
+      describe("stale expiration timer", () => {
+        let clock: sinon.SinonFakeTimers | undefined;
+        let runId = 0;
+
+        beforeEach(() => {
+          // Redis keeps the TTL server-side, so only LocalPresence's timer is
+          // fakeable; Redis tests use real short TTLs instead.
+          if (presence instanceof LocalPresence) {
+            clock = sinon.useFakeTimers();
+          }
+        });
+
+        afterEach(async () => {
+          clock?.restore();
+          clock = undefined;
+        });
+
+        // advance past a TTL regardless of which implementation is under test
+        async function past(ms: number) {
+          if (clock) {
+            await clock.tickAsync(ms);
+          } else {
+            await timeout(ms);
+          }
+        }
+
+        const SHORT = 1;
+        const LONG = 3;
+        const key = () => `stale-ttl-${runId}`;
+
+        beforeEach(() => { runId++; });
+
+        it("short setex() overwritten by a plain set() survives the old TTL", async () => {
+          const k = key();
+          await presence.setex(k, "with-ttl", SHORT);
+          await presence.set(k, "no-ttl"); // SET removes any existing TTL
+
+          await past(SHORT * 1000 + 100);
+          assert.strictEqual("no-ttl", await presence.get(k));
+
+          // nothing deferred: it must still be there long afterwards
+          await past(LONG * 1000);
+          assert.strictEqual("no-ttl", await presence.get(k));
+          assert.strictEqual(true, await presence.exists(k));
+
+          await presence.del(k);
+        });
+
+        it("del() + recreate survives the old TTL, regardless of recreated type", async () => {
+          const k = key();
+          await presence.setex(k, "old", SHORT);
+          await presence.del(k);
+
+          // recreate as a plain string
+          await presence.set(k, "recreated-string");
+          await past(SHORT * 1000 + 100);
+          assert.strictEqual("recreated-string", await presence.get(k));
+          await presence.del(k);
+
+          // recreate as a set
+          await presence.setex(k, "old", SHORT);
+          await presence.del(k);
+          await presence.sadd(k, "recreated-member");
+          await past(SHORT * 1000 + 100);
+          assert.deepStrictEqual(["recreated-member"], await presence.smembers(k));
+          await presence.del(k);
+
+          // recreate as a hash
+          await presence.setex(k, "old", SHORT);
+          await presence.del(k);
+          await presence.hset(k, "field", "recreated-hash");
+          await past(SHORT * 1000 + 100);
+          assert.strictEqual("recreated-hash", await presence.hget(k, "field"));
+          await presence.del(k);
+        });
+
+        it("repeated renewal with longer TTLs: only the last TTL deletes the value", async () => {
+          const k = key();
+          await presence.setex(k, "v1", SHORT);
+          await past(SHORT * 1000 - 100);
+          assert.strictEqual("v1", await presence.get(k));
+
+          // renew with a longer TTL before the first one elapses
+          await presence.setex(k, "v2", LONG);
+          await past(SHORT * 1000);
+          assert.strictEqual("v2", await presence.get(k), "short TTL must not delete the renewed value");
+
+          // renew again: only this final deadline applies
+          await presence.expire(k, LONG);
+          await past(LONG * 1000 - 100);
+          assert.strictEqual("v2", await presence.get(k));
+          await past(200);
+          assert.ok(!(await presence.get(k)));
+        });
+        it("expire() on a missing key sets no timer and cannot delete a later value", async () => {
+          const k = key();
+          await presence.expire(k, SHORT);
+          await presence.set(k, "created-after-expire");
+
+          await past(SHORT * 1000 + 100);
+          assert.strictEqual("created-after-expire", await presence.get(k));
+          await presence.del(k);
+
+          // same for a hash created afterwards
+          await presence.expire(k, SHORT);
+          await presence.hset(k, "field", "hash-after-expire");
+          await past(SHORT * 1000 + 100);
+          assert.strictEqual("hash-after-expire", await presence.hget(k, "field"));
+          await presence.del(k);
+
+          // and for a set
+          await presence.expire(k, SHORT);
+          await presence.sadd(k, "set-after-expire");
+          await past(SHORT * 1000 + 100);
+          assert.deepStrictEqual(["set-after-expire"], await presence.smembers(k));
+          await presence.del(k);
+        });
+
+        it("expiring one key does not affect other strings, sets or hashes", async () => {
+          const k = key();
+          await presence.setex(k, "string", SHORT);
+          await presence.set(`${k}-other`, "string2");
+          await presence.sadd(`${k}-set`, "member");
+          await presence.hset(`${k}-hash`, "field", "value");
+
+          await past(SHORT * 1000 + 100);
+
+          assert.ok(!(await presence.get(k)));
+          assert.strictEqual("string2", await presence.get(`${k}-other`));
+          assert.deepStrictEqual(["member"], await presence.smembers(`${k}-set`));
+          assert.strictEqual("value", await presence.hget(`${k}-hash`, "field"));
+
+          await presence.del(`${k}-other`);
+          await presence.del(`${k}-set`);
+          await presence.del(`${k}-hash`);
+        });
       });
 
     });
